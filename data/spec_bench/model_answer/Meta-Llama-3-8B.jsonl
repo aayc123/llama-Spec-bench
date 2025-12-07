@@ -1,0 +1,1 @@
+{"question_id": 81, "category": "writing", "answer_id": "ADXNarnSmfQuykw4s2E7wM", "model_id": "Meta-Llama-3-8B", "choices": [{"index": 0, "turns": ["ERROR", "ERROR"], "decoding_steps": [0, 0], "new_tokens": [0, 0], "wall_time": [0.0, 0.0], "accept_lengths": []}], "tstamp": 1764912805.0064957}

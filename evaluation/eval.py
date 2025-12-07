@@ -15,7 +15,8 @@ import shortuuid
 from fastchat.llm_judge.common import load_questions
 from fastchat.model import get_conversation_template
 from tqdm import tqdm
-
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 
 def run_eval(
         model,
@@ -68,168 +69,193 @@ def run_eval(
         ray.get(ans_handles)
 
 
+
 @torch.inference_mode()
 def get_model_answers(
-        model,
-        tokenizer,
-        forward_func,
-        model_id,
-        questions,
-        answer_file,
-        max_new_tokens,
-        num_choices,
-        **kwargs,
+    model,
+    tokenizer,
+    forward_func,
+    model_id,
+    questions,
+    answer_file,
+    max_new_tokens,
+    num_choices,
+    **kwargs,
 ):
-
     model.eval()
     print('Check model training state:', model.training)
+    
+    # 确保 tokenizer 设置了 padding token
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        
+    print(f"DEBUG: Using Chat Template: {tokenizer.chat_template is not None}")
 
-    cuda_visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES')
-    print('CUDA VISIBLE DEVICES:', cuda_visible_devices)
-
-    question = questions[0]
-
-    # warmup
+    # ================= Warmup =================
+    print("Starting Warmup...")
     for _ in range(3):
         torch.manual_seed(0)
-        conv = get_conversation_template("vicuna")
-        turns = []
-        steps = []
-        new_tokens = []
-        wall_time = []
-        for j in range(len(question["turns"])):
-            qs = question["turns"][j]
-            conv.append_message(conv.roles[0], qs)
-            conv.append_message(conv.roles[1], None)
-            conv.stop_str = "</s>"
-            prompt = conv.get_prompt()
-            inputs = tokenizer([prompt], return_tensors="pt").to("cuda")
-            input_ids = inputs.input_ids
-            try:
-                torch.cuda.synchronize()
-                start_time = time.time()
-                output_ids, new_token, step, accept_length_tree = forward_func(
-                    inputs,
-                    model,
-                    tokenizer,
-                    max_new_tokens,
-                    **kwargs,
-                )
-                torch.cuda.synchronize()
-                total_time = time.time() - start_time
-                output_ids = output_ids[0][len(input_ids[0]):]
-                # be consistent with the template's stop_token_ids
-                if conv.stop_token_ids:
-                    stop_token_ids_index = [
-                        i
-                        for i, id in enumerate(output_ids)
-                        if id in conv.stop_token_ids
-                    ]
-                    if len(stop_token_ids_index) > 0:
-                        output_ids = output_ids[: stop_token_ids_index[0]]
-
-                output = tokenizer.decode(
-                    output_ids,
-                    spaces_between_special_tokens=False,
-                )
-                if conv.stop_str and output.find(conv.stop_str) > 0:
-                    output = output[: output.find(conv.stop_str)]
-                for special_token in tokenizer.special_tokens_map.values():
-                    if isinstance(special_token, list):
-                        for special_tok in special_token:
-                            output = output.replace(special_tok, "")
-                    else:
-                        output = output.replace(special_token, "")
-                output = output.strip()
-
-                if conv.name == "xgen" and output.startswith("Assistant:"):
-                    output = output.replace("Assistant:", "", 1).strip()
-            except RuntimeError as e:
-                print("ERROR question ID: ", question["question_id"])
-                output = "ERROR"
-
-            turns.append(output)
-            steps.append(int(step))
-            new_tokens.append(int(new_token))
-            wall_time.append(total_time)
-            conv.messages[-1][-1] = output
+        # 构建一个简单的符合 Llama-3 格式的 warmup 输入
+        warmup_msgs = [{"role": "user", "content": "Hello"}]
+        
+        # 使用 apply_chat_template 或 fallback
+        try:
+            if tokenizer.chat_template:
+                input_ids = tokenizer.apply_chat_template(
+                    warmup_msgs, 
+                    add_generation_prompt=True, 
+                    return_tensors="pt", 
+                ).to(model.device)
+            else:
+                # Fallback: 手动构建 Llama-3 格式
+                text = "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\nHello<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+                input_ids = tokenizer.encode(text, return_tensors="pt").to(model.device)
+        except Exception as e:
+            print(f"Tokenization failed: {e}")
+            # 简单的 fallback
+            input_ids = torch.tensor([[1, 2, 3]], device=model.device)
+        
+        inputs = {
+            "input_ids": input_ids,
+            "attention_mask": torch.ones_like(input_ids)
+        }
+        
+        try:
+            torch.cuda.synchronize()
+            # 调用 forward_func
+            forward_func(
+                inputs,  # 传入字典格式
+                model,
+                tokenizer,
+                max_new_tokens=20,
+                **kwargs,
+            )
+            torch.cuda.synchronize()
+        except Exception as e:
+            print(f"Warmup failed: {e}")
     print('Warmup done')
 
+    # ================= Main Loop =================
     accept_lengths_tree = []
+    
     for question in tqdm(questions):
-
         choices = []
         for i in range(num_choices):
             cur_accept_lengths_tree = []
             torch.manual_seed(i)
-            conv = get_conversation_template("vicuna")
+            
+            messages = [] 
             turns = []
             steps = []
             new_tokens = []
             wall_time = []
+            
             for j in range(len(question["turns"])):
                 qs = question["turns"][j]
-                conv.append_message(conv.roles[0], qs)
-                conv.append_message(conv.roles[1], None)
-                conv.stop_str = "</s>"
-                prompt = conv.get_prompt()
-                inputs = tokenizer([prompt], return_tensors="pt").to("cuda")
-                input_ids = inputs.input_ids
+                
+                # ✅ 每个 turn 都重新构建完整的对话历史
+                messages = []
+                # 添加之前的所有轮次
+                for k in range(j):
+                    messages.append({"role": "user", "content": question["turns"][k]})
+                    messages.append({"role": "assistant", "content": turns[k]})
+                # 添加当前问题
+                messages.append({"role": "user", "content": qs})
+                
+                # 构建输入
+                try:
+                    if tokenizer.chat_template:
+                        input_ids = tokenizer.apply_chat_template(
+                            messages, 
+                            add_generation_prompt=True, 
+                            return_tensors="pt",
+                        ).to(model.device)
+                    else:
+                        # Fallback: 手动构建对话格式
+                        test_text = "test"
+                        test_ids = tokenizer.encode(test_text, add_special_tokens=True)
+                        has_auto_bos = test_ids[0] == tokenizer.bos_token_id if tokenizer.bos_token_id else False
+                        
+                        text = "" if has_auto_bos else "<|begin_of_text|>"
+                        for msg in messages:
+                            text += f"<|start_header_id|>{msg['role']}<|end_header_id|>\n\n{msg['content']}<|eot_id|>"
+                        text += "<|start_header_id|>assistant<|end_header_id|>\n\n"
+                        input_ids = tokenizer.encode(text, return_tensors="pt", add_special_tokens=has_auto_bos).to(model.device)
+                        
+                    # 🔍 添加调试输出
+                    if j == 0:  # 只在第一个turn打印
+                        print(f"\n{'='*80}")
+                        print(f"Question ID: {question['question_id']}")
+                        print(f"Question: {qs[:100]}...")
+                        decoded = tokenizer.decode(input_ids[0], skip_special_tokens=False)
+                        print(f"Tokenized prompt (first 200 chars): {decoded[:200]}...")
+                        print(f"{'='*80}\n")
+                        
+                except Exception as e:
+                    print(f"Tokenization failed for question {question['question_id']}: {e}")
+                    # 简单的 fallback
+                    input_ids = torch.tensor([[1, 2, 3]], device=model.device)
+                
+                model_inputs = {
+                    "input_ids": input_ids,
+                    "attention_mask": torch.ones_like(input_ids)
+                }
+                
+                input_ids_len = model_inputs['input_ids'].shape[1]
+                
+                output_str = "ERROR"
+                step = 0
+                new_token = 0
+                accept_length_tree = []
+                total_time = 0.0
+
                 try:
                     torch.cuda.synchronize()
                     start_time = time.time()
+                    
+                    # 调用推理函数
                     output_ids, new_token, step, accept_length_tree = forward_func(
-                        inputs,
+                        model_inputs,
                         model,
                         tokenizer,
                         max_new_tokens,
                         **kwargs,
                     )
+                    
                     torch.cuda.synchronize()
                     total_time = time.time() - start_time
-                    accept_lengths_tree.extend(accept_length_tree)
-                    output_ids = output_ids[0][len(input_ids[0]):]
+                    
+                    # 处理输出
+                    if isinstance(output_ids, torch.Tensor):
+                        generated_ids = output_ids[0][input_ids_len:] 
+                        output_str = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+                    else:
+                        print(f"Warning: output_ids is not Tensor, type: {type(output_ids)}")
+                        output_str = "ERROR"
 
-                    if conv.stop_token_ids:
-                        stop_token_ids_index = [
-                            i
-                            for i, id in enumerate(output_ids)
-                            if id in conv.stop_token_ids
-                        ]
-                        if len(stop_token_ids_index) > 0:
-                            output_ids = output_ids[: stop_token_ids_index[0]]
-
-                    output = tokenizer.decode(
-                        output_ids,
-                        spaces_between_special_tokens=False,
-                    )
-                    if conv.stop_str and output.find(conv.stop_str) > 0:
-                        output = output[: output.find(conv.stop_str)]
-                    for special_token in tokenizer.special_tokens_map.values():
-                        if isinstance(special_token, list):
-                            for special_tok in special_token:
-                                output = output.replace(special_tok, "")
-                        else:
-                            output = output.replace(special_token, "")
-                    output = output.strip()
-
-                    if conv.name == "xgen" and output.startswith("Assistant:"):
-                        output = output.replace("Assistant:", "", 1).strip()
                 except RuntimeError as e:
-                    print("ERROR question ID: ", question["question_id"])
-                    output = "ERROR"
-
-                turns.append(output)
+                    print(f"ERROR question ID: {question['question_id']}, Error: {e}")
+                    output_str = "ERROR"
+                    import traceback
+                    traceback.print_exc()
+                
+                turns.append(output_str)
                 steps.append(int(step))
                 new_tokens.append(int(new_token))
                 wall_time.append(total_time)
                 cur_accept_lengths_tree.extend(accept_length_tree)
-                conv.messages[-1][-1] = output
-            # torch.cuda.empty_cache()
-            choices.append({"index": i, "turns": turns, "decoding_steps": steps, "new_tokens": new_tokens, "wall_time": wall_time,
-                            "accept_lengths": cur_accept_lengths_tree})
 
-        # Dump answers
+            choices.append({
+                "index": i, 
+                "turns": turns, 
+                "decoding_steps": steps, 
+                "new_tokens": new_tokens, 
+                "wall_time": wall_time,
+                "accept_lengths": cur_accept_lengths_tree
+            })
+            
+            accept_lengths_tree.extend(cur_accept_lengths_tree)
+
         os.makedirs(os.path.dirname(answer_file), exist_ok=True)
         with open(os.path.expanduser(answer_file), "a") as fout:
             ans_json = {
@@ -241,7 +267,11 @@ def get_model_answers(
                 "tstamp": time.time(),
             }
             fout.write(json.dumps(ans_json) + "\n")
-    print("#Mean accepted tokens: ", np.mean(accept_lengths_tree))
+
+    if len(accept_lengths_tree) > 0:
+        print("#Mean accepted tokens: ", np.mean(accept_lengths_tree))
+    else:
+        print("#Mean accepted tokens: N/A")
 
 
 def reorg_answer_file(answer_file):
@@ -257,3 +287,188 @@ def reorg_answer_file(answer_file):
         for qid in qids:
             fout.write(answers[qid])
 
+
+# @torch.inference_mode()
+# def get_model_answers(
+#         model,
+#         tokenizer,
+#         forward_func,
+#         model_id,
+#         questions,
+#         answer_file,
+#         max_new_tokens,
+#         num_choices,
+#         **kwargs,
+# ):
+
+#     model.eval()
+#     print('Check model training state:', model.training)
+
+#     cuda_visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES')
+#     print('CUDA VISIBLE DEVICES:', cuda_visible_devices)
+
+#     question = questions[0]
+
+#     # warmup
+#     for _ in range(3):
+#         torch.manual_seed(0)
+#         conv = get_conversation_template("vicuna")
+#         turns = []
+#         steps = []
+#         new_tokens = []
+#         wall_time = []
+#         for j in range(len(question["turns"])):
+#             qs = question["turns"][j]
+#             conv.append_message(conv.roles[0], qs)
+#             conv.append_message(conv.roles[1], None)
+#             conv.stop_str = "</s>"
+#             prompt = conv.get_prompt()
+#             inputs = tokenizer([prompt], return_tensors="pt").to("cuda")
+#             input_ids = inputs.input_ids
+#             output = "ERROR"
+#             total_time = 0.0
+#             new_token = 0
+#             step = 0
+#             accept_length_tree = []
+#             try:
+#                 torch.cuda.synchronize()
+#                 start_time = time.time()
+#                 output_ids, new_token, step, accept_length_tree = forward_func(
+#                     inputs,
+#                     model,
+#                     tokenizer,
+#                     max_new_tokens,
+#                     **kwargs,
+#                 )
+#                 torch.cuda.synchronize()
+#                 total_time = time.time() - start_time
+#                 output_ids = output_ids[0][len(input_ids[0]):]
+#                 # be consistent with the template's stop_token_ids
+#                 if conv.stop_token_ids:
+#                     stop_token_ids_index = [
+#                         i
+#                         for i, id in enumerate(output_ids)
+#                         if id in conv.stop_token_ids
+#                     ]
+#                     if len(stop_token_ids_index) > 0:
+#                         output_ids = output_ids[: stop_token_ids_index[0]]
+
+#                 output = tokenizer.decode(
+#                     output_ids,
+#                     spaces_between_special_tokens=False,
+#                 )
+#                 if conv.stop_str and output.find(conv.stop_str) > 0:
+#                     output = output[: output.find(conv.stop_str)]
+#                 for special_token in tokenizer.special_tokens_map.values():
+#                     if isinstance(special_token, list):
+#                         for special_tok in special_token:
+#                             output = output.replace(special_tok, "")
+#                     else:
+#                         output = output.replace(special_token, "")
+#                 output = output.strip()
+
+#                 if conv.name == "xgen" and output.startswith("Assistant:"):
+#                     output = output.replace("Assistant:", "", 1).strip()
+#             except RuntimeError as e:
+#                 print("ERROR question ID: ", question["question_id"])
+#                 output = "ERROR"
+
+#             turns.append(output)
+#             steps.append(int(step))
+#             new_tokens.append(int(new_token))
+#             wall_time.append(total_time)
+#             conv.messages[-1][-1] = output
+#     print('Warmup done')
+
+#     accept_lengths_tree = []
+#     for question in tqdm(questions):
+
+#         choices = []
+#         for i in range(num_choices):
+#             cur_accept_lengths_tree = []
+#             torch.manual_seed(i)
+#             conv = get_conversation_template("vicuna")
+#             turns = []
+#             steps = []
+#             new_tokens = []
+#             wall_time = []
+#             for j in range(len(question["turns"])):
+#                 qs = question["turns"][j]
+#                 conv.append_message(conv.roles[0], qs)
+#                 conv.append_message(conv.roles[1], None)
+#                 conv.stop_str = "</s>"
+#                 prompt = conv.get_prompt()
+#                 inputs = tokenizer([prompt], return_tensors="pt").to("cuda")
+#                 input_ids = inputs.input_ids
+#                 output = "ERROR"
+#                 total_time = 0.0
+#                 new_token = 0
+#                 step = 0
+#                 accept_length_tree = []
+#                 try:
+#                     torch.cuda.synchronize()
+#                     start_time = time.time()
+#                     output_ids, new_token, step, accept_length_tree = forward_func(
+#                         inputs,
+#                         model,
+#                         tokenizer,
+#                         max_new_tokens,
+#                         **kwargs,
+#                     )
+#                     torch.cuda.synchronize()
+#                     total_time = time.time() - start_time
+#                     accept_lengths_tree.extend(accept_length_tree)
+#                     output_ids = output_ids[0][len(input_ids[0]):]
+
+#                     if conv.stop_token_ids:
+#                         stop_token_ids_index = [
+#                             i
+#                             for i, id in enumerate(output_ids)
+#                             if id in conv.stop_token_ids
+#                         ]
+#                         if len(stop_token_ids_index) > 0:
+#                             output_ids = output_ids[: stop_token_ids_index[0]]
+
+#                     output = tokenizer.decode(
+#                         output_ids,
+#                         spaces_between_special_tokens=False,
+#                     )
+#                     if conv.stop_str and output.find(conv.stop_str) > 0:
+#                         output = output[: output.find(conv.stop_str)]
+#                     for special_token in tokenizer.special_tokens_map.values():
+#                         if isinstance(special_token, list):
+#                             for special_tok in special_token:
+#                                 output = output.replace(special_tok, "")
+#                         else:
+#                             output = output.replace(special_token, "")
+#                     output = output.strip()
+
+#                     if conv.name == "xgen" and output.startswith("Assistant:"):
+#                         output = output.replace("Assistant:", "", 1).strip()
+#                 except RuntimeError as e:
+#                     print("ERROR question ID: ", question["question_id"])
+#                     output = "ERROR"
+
+#                 turns.append(output)
+#                 steps.append(int(step))
+#                 new_tokens.append(int(new_token))
+#                 wall_time.append(total_time)
+#                 cur_accept_lengths_tree.extend(accept_length_tree)
+#                 conv.messages[-1][-1] = output
+#             # torch.cuda.empty_cache()
+#             choices.append({"index": i, "turns": turns, "decoding_steps": steps, "new_tokens": new_tokens, "wall_time": wall_time,
+#                             "accept_lengths": cur_accept_lengths_tree})
+
+#         # Dump answers
+#         os.makedirs(os.path.dirname(answer_file), exist_ok=True)
+#         with open(os.path.expanduser(answer_file), "a") as fout:
+#             ans_json = {
+#                 "question_id": question["question_id"],
+#                 "category": question["category"],
+#                 "answer_id": shortuuid.uuid(),
+#                 "model_id": model_id,
+#                 "choices": choices,
+#                 "tstamp": time.time(),
+#             }
+#             fout.write(json.dumps(ans_json) + "\n")
+#     print("#Mean accepted tokens: ", np.mean(accept_lengths_tree))

@@ -1,7 +1,7 @@
 import json
 import argparse
 import os
-
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 
 def get_content(jsonfile_path="../data/mt_bench/model_answer/vicuna-7b-v1.3-pld-float32.jsonl",
                 output_path="../data/mt_bench/model_answer/txt/vicuna-7b-v1.3-pld-float32.txt"):
