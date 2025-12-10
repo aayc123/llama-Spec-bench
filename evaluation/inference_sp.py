@@ -2,7 +2,7 @@ import os
 print("=== 环境变量检查 ===")
 print("CUDA_VISIBLE_DEVICES:", os.environ.get("CUDA_VISIBLE_DEVICES", "未设置"))
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "4"
 print("设置后:", os.environ.get("CUDA_VISIBLE_DEVICES"))
 
 import torch
@@ -67,7 +67,7 @@ def ssd_forward(inputs, model, tokenizer, max_new_tokens, temperature=0.0, do_sa
             do_sample=do_sample,
             temperature=temperature,
             early_stop=True,
-            #max_step_draft=10,  # 增加到8
+            max_step_draft=10, 
             #th_stop_draft=0.3,
             # th_random_draft=1.0,
             # auto_th_stop_draft=True,
