@@ -29,3 +29,13 @@ CUDA_VISIBLE_DEVICES=${GPU_DEVICES} python -m evaluation.inference_samd --model-
 
 cd /data/zn/Spec-Bench
 python3 evaluation/inference_sp.py --model-path /data/zn/model/models/Meta-Llama-3-8B --model-id Meta-Llama-3-8B --bench-name spec_bench --max-new-tokens 512 --temperature 0.0
+
+python3 evaluation/inference_baseline.py --model-path /data/zn/model/models/Meta-Llama-3-8B --model-id Meta-Llama-3-8B-baseline --bench-name spec_bench --max-new-tokens 128 --temperature 0.0 --question-begin 0   --question-end 5
+
+python3 evaluation/inference_swift.py --model-path /data/zn/model/models/Meta-Llama-3-8B --model-id Meta-Llama-3-8B-swift --bench-name spec_bench --max-new-tokens 128 --temperature 0.0 --question-begin 0   --question-end 120
+
+python3 evaluation/speed.py \
+  --file-path /data/zn/Spec-Bench/data/spec_bench/model_answer/Meta-Llama-3-8B-p.jsonl \
+  --base-path Spec-Bench/data/spec_bench/model_answer/Meta-Llama-3-8B-j-3-1.jsonl \
+  --tokenizer-path /data/zn/model/models/Meta-Llama-3-8B
+
